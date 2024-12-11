@@ -12,6 +12,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <string.h>
+#include <uthash.h>
 #include <xcb/render.h>        // for xcb_render_fixed_t, XXX
 #include <xcb/xcb.h>
 #include <xcb/xfixes.h>
@@ -26,16 +27,6 @@
 #include "wm/defs.h"
 
 typedef struct session session_t;
-
-/// @brief Possible backends
-enum backend {
-	BKEND_XRENDER,
-	BKEND_GLX,
-	BKEND_XR_GLX_HYBRID,
-	BKEND_DUMMY,
-	BKEND_EGL,
-	NUM_BKEND,
-};
 
 typedef struct win_option_mask {
 	bool shadow : 1;
@@ -82,11 +73,18 @@ enum animation_trigger {
 	ANIMATION_TRIGGER_OPEN,
 	/// When a window is closed
 	ANIMATION_TRIGGER_CLOSE,
-	/// When a window's geometry changes
-	ANIMATION_TRIGGER_GEOMETRY,
+	/// When a window's size changes
+	ANIMATION_TRIGGER_SIZE,
+	/// When a window's position changes
+	ANIMATION_TRIGGER_POSITION,
 
 	ANIMATION_TRIGGER_INVALID,
 	ANIMATION_TRIGGER_COUNT = ANIMATION_TRIGGER_INVALID,
+
+	// Aliases are not included in the count
+
+	/// Alias of size + position
+	ANIMATION_TRIGGER_ALIAS_GEOMETRY,
 };
 
 static const char *animation_trigger_names[] attr_unused = {
@@ -96,7 +94,9 @@ static const char *animation_trigger_names[] attr_unused = {
     [ANIMATION_TRIGGER_DECREASE_OPACITY] = "decrease-opacity",
     [ANIMATION_TRIGGER_OPEN] = "open",
     [ANIMATION_TRIGGER_CLOSE] = "close",
-    [ANIMATION_TRIGGER_GEOMETRY] = "geometry",
+    [ANIMATION_TRIGGER_SIZE] = "size",
+    [ANIMATION_TRIGGER_POSITION] = "position",
+    [ANIMATION_TRIGGER_ALIAS_GEOMETRY] = "geometry",
 };
 
 struct script;
@@ -199,9 +199,6 @@ struct window_maybe_options {
 	struct win_script animations[ANIMATION_TRIGGER_COUNT];
 };
 
-// Make sure `window_options` has no implicit padding.
-#pragma GCC diagnostic push
-#pragma GCC diagnostic error "-Wpadded"
 /// Like `window_maybe_options`, but all fields are guaranteed to be set.
 struct window_options {
 	double opacity;
@@ -220,17 +217,17 @@ struct window_options {
 
 	struct win_script animations[ANIMATION_TRIGGER_COUNT];
 };
-#pragma GCC diagnostic pop
 
-static inline bool
-win_options_no_damage(const struct window_options *a, const struct window_options *b) {
-	// Animation changing does not immediately change how window is rendered, so
-	// they don't cause damage.
-	return memcmp(a, b, offsetof(struct window_options, animations)) == 0;
-}
+struct option_name {
+	UT_hash_handle hh;
+	const char *name;
+};
 
 /// Structure representing all options.
 typedef struct options {
+	// === Deprecation ===
+	struct option_name *problematic_options;
+
 	// === Config ===
 	/// Path to the config file
 	char *config_file_path;
@@ -261,8 +258,6 @@ typedef struct options {
 	bool glx_no_stencil;
 	/// Whether to avoid rebinding pixmap on window damage.
 	bool glx_no_rebind_pixmap;
-	/// Custom fragment shader for painting windows, as a string.
-	char *glx_fshader_win_str;
 	/// Whether to detect rounded corners.
 	bool detect_rounded_corners;
 	/// Force painting of window content with blending.
@@ -440,9 +435,27 @@ typedef struct options {
 	bool has_both_style_of_rules;
 } options_t;
 
-extern const char *const BACKEND_STRS[NUM_BKEND + 1];
-
 bool load_plugin(const char *name, const char *include_dir);
+static inline void record_problematic_option(struct options *opt, const char *name) {
+	struct option_name *record = calloc(1, sizeof(*record));
+	record->name = name;
+	HASH_ADD_STR(opt->problematic_options, name, record);
+}
+
+static inline void
+report_deprecated_option(struct options *opt, const char *name, bool error) {
+	struct option_name *record = NULL;
+	HASH_FIND_STR(opt->problematic_options, name, record);
+	if (record != NULL) {
+		return;
+	}
+	enum log_level level = error ? LOG_LEVEL_ERROR : LOG_LEVEL_WARN;
+	LOG_(level,
+	     "Option \"%s\" is deprecated, please remove it from your config file and/or "
+	     "command line options.",
+	     name);
+	record_problematic_option(opt, name);
+}
 
 bool must_use parse_long(const char *, long *);
 bool must_use parse_int(const char *, int *);
@@ -474,30 +487,6 @@ bool parse_config_libconfig(options_t *, const char *config_file);
 bool parse_config(options_t *, const char *config_file);
 
 /**
- * Parse a backend option argument.
- */
-static inline attr_pure int parse_backend(const char *str) {
-	for (int i = 0; BACKEND_STRS[i]; ++i) {
-		if (strcasecmp(str, BACKEND_STRS[i]) == 0) {
-			return i;
-		}
-	}
-	// Keep compatibility with an old revision containing a spelling mistake...
-	if (strcasecmp(str, "xr_glx_hybird") == 0) {
-		log_warn("backend xr_glx_hybird should be xr_glx_hybrid, the misspelt "
-		         "version will be removed soon.");
-		return BKEND_XR_GLX_HYBRID;
-	}
-	// cju wants to use dashes
-	if (strcasecmp(str, "xr-glx-hybrid") == 0) {
-		log_warn("backend xr-glx-hybrid should be xr_glx_hybrid, the alternative "
-		         "version will be removed soon.");
-		return BKEND_XR_GLX_HYBRID;
-	}
-	return NUM_BKEND;
-}
-
-/**
  * Parse a VSync option argument.
  */
 static inline bool parse_vsync(const char *str) {
@@ -511,10 +500,12 @@ static inline bool parse_vsync(const char *str) {
 /// Generate animation script for legacy fading options
 void generate_fading_config(struct options *opt);
 
-static inline void log_warn_both_style_of_rules(const char *option_name) {
+static inline void log_warn_both_style_of_rules(struct options *opt, const char *option_name) {
 	log_warn("Option \"%s\" is set along with \"rules\". \"rules\" will take "
 	         "precedence, and \"%s\" will have no effect.",
 	         option_name, option_name);
+	opt->has_both_style_of_rules = true;
+	record_problematic_option(opt, option_name);
 }
 enum animation_trigger parse_animation_trigger(const char *trigger);
 

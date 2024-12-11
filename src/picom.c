@@ -60,8 +60,10 @@
 #include "utils/file_watch.h"
 #include "utils/list.h"
 #include "utils/misc.h"
+#include "utils/process.h"
 #include "utils/statistics.h"
 #include "utils/str.h"
+#include "utils/ui.h"
 #include "utils/uthash_extra.h"
 #include "vblank.h"
 #include "wm/defs.h"
@@ -101,16 +103,6 @@ const struct wintype_info WINTYPES[] = {
     X(dnd, DND),
 #undef X
 };
-
-// clang-format off
-/// Names of backends.
-const char *const BACKEND_STRS[] = {[BKEND_XRENDER] = "xrender",
-                                    [BKEND_GLX] = "glx",
-                                    [BKEND_XR_GLX_HYBRID] = "xr_glx_hybrid",
-                                    [BKEND_DUMMY] = "dummy",
-                                    [BKEND_EGL] = "egl",
-                                    NULL};
-// clang-format on
 
 // === Global variables ===
 
@@ -453,7 +445,7 @@ static void destroy_backend(session_t *ps) {
 			//      handled until they are mapped.
 			//   2. If we haven't had chance to handle the stale flags. This
 			//      could happen if we received a root ConfigureNotify
-			//      _immidiately_ after we redirected.
+			//      _immediately_ after we redirected.
 			win_clear_flags(w, WIN_FLAGS_PIXMAP_STALE);
 			win_release_images(ps->backend_data, w);
 		}
@@ -609,7 +601,7 @@ err:
 void configure_root(session_t *ps) {
 	// TODO(yshui) re-initializing backend should be done outside of the
 	// critical section. Probably set a flag and do it in draw_callback_impl.
-	auto r = XCB_AWAIT(xcb_get_geometry, ps->c.c, ps->c.screen_info->root);
+	auto r = XCB_AWAIT(xcb_get_geometry, &ps->c, ps->c.screen_info->root);
 	if (!r) {
 		log_fatal("Failed to fetch root geometry");
 		abort();
@@ -795,7 +787,6 @@ static bool paint_preprocess(session_t *ps, bool *animation, struct win **out_bo
 			unredir_possible = true;
 		}
 
-		w->prev_trans = bottom;
 		bottom = w;
 
 		// If the screen is not redirected check if the window's unredir setting
@@ -958,7 +949,7 @@ static int register_cm(session_t *ps) {
 		                 prop_is_utf8[i] ? ps->atoms->aUTF8_STRING : XCB_ATOM_STRING,
 		                 8, strlen("picom"), "picom"));
 		if (e) {
-			log_error_x_error(e, "Failed to set window property %d",
+			log_error_x_error(&ps->c, e, "Failed to set window property %d",
 			                  prop_atoms[i]);
 			free(e);
 		}
@@ -970,7 +961,7 @@ static int register_cm(session_t *ps) {
 	                                         ps->atoms->aWM_CLASS, XCB_ATOM_STRING, 8,
 	                                         ARR_SIZE(picom_class), picom_class));
 	if (e) {
-		log_error_x_error(e, "Failed to set the WM_CLASS property");
+		log_error_x_error(&ps->c, e, "Failed to set the WM_CLASS property");
 		free(e);
 	}
 
@@ -987,8 +978,9 @@ static int register_cm(session_t *ps) {
 			                 ps->atoms->aWM_CLIENT_MACHINE, XCB_ATOM_STRING,
 			                 8, (uint32_t)strlen(hostname), hostname));
 			if (e) {
-				log_error_x_error(e, "Failed to set the WM_CLIENT_MACHINE"
-				                     " property");
+				log_error_x_error(&ps->c, e,
+				                  "Failed to set the WM_CLIENT_MACHINE"
+				                  " property");
 				free(e);
 			}
 		} else {
@@ -1011,7 +1003,7 @@ static int register_cm(session_t *ps) {
 	                                   ps->atoms->aCOMPTON_VERSION, XCB_ATOM_STRING, 8,
 	                                   (uint32_t)strlen(PICOM_VERSION), PICOM_VERSION));
 	if (e) {
-		log_error_x_error(e, "Failed to set COMPTON_VERSION.");
+		log_error_x_error(&ps->c, e, "Failed to set COMPTON_VERSION.");
 		free(e);
 	}
 
@@ -1075,13 +1067,13 @@ static bool init_overlay(session_t *ps) {
 	if (ps->overlay != XCB_NONE) {
 		// Set window region of the overlay window, code stolen from
 		// compiz-0.8.8
-		if (!XCB_AWAIT_VOID(xcb_shape_mask, ps->c.c, XCB_SHAPE_SO_SET,
+		if (!XCB_AWAIT_VOID(xcb_shape_mask, &ps->c, XCB_SHAPE_SO_SET,
 		                    XCB_SHAPE_SK_BOUNDING, ps->overlay, 0, 0, 0)) {
 			log_fatal("Failed to set the bounding shape of overlay, giving "
 			          "up.");
 			return false;
 		}
-		if (!XCB_AWAIT_VOID(xcb_shape_rectangles, ps->c.c, XCB_SHAPE_SO_SET,
+		if (!XCB_AWAIT_VOID(xcb_shape_rectangles, &ps->c, XCB_SHAPE_SO_SET,
 		                    XCB_SHAPE_SK_INPUT, XCB_CLIP_ORDERING_UNSORTED,
 		                    ps->overlay, 0, 0, 0, NULL)) {
 			log_fatal("Failed to set the input shape of overlay, giving up.");
@@ -1097,7 +1089,7 @@ static bool init_overlay(session_t *ps) {
 		// root_damage = XDamageCreate(ps->dpy, root, XDamageReportNonEmpty);
 
 		// Unmap the overlay, we will map it when needed in redirect_start
-		XCB_AWAIT_VOID(xcb_unmap_window, ps->c.c, ps->overlay);
+		XCB_AWAIT_VOID(xcb_unmap_window, &ps->c, ps->overlay);
 	} else {
 		log_error("Cannot get X Composite overlay window. Falling "
 		          "back to painting on root window.");
@@ -1183,7 +1175,7 @@ static bool redirect_start(session_t *ps) {
 		xcb_map_window(ps->c.c, ps->overlay);
 	}
 
-	bool success = XCB_AWAIT_VOID(xcb_composite_redirect_subwindows, ps->c.c,
+	bool success = XCB_AWAIT_VOID(xcb_composite_redirect_subwindows, &ps->c,
 	                              ps->c.screen_info->root, session_redirection_mode(ps));
 	if (!success) {
 		log_fatal("Another composite manager is already running "
@@ -1203,8 +1195,8 @@ static bool redirect_start(session_t *ps) {
 
 	ps->frame_pacing = ps->o.frame_pacing && ps->o.vsync;
 	if ((ps->o.benchmark || !ps->backend_data->ops.last_render_time) && ps->frame_pacing) {
-		// Disable frame pacing if we are using a legacy backend or if we are in
-		// benchmark mode, or if the backend doesn't report render time
+		// Disable frame pacing if we are in benchmark mode or if the backend
+		// doesn't report render time.
 		log_info("Disabling frame pacing.");
 		ps->frame_pacing = false;
 	}
@@ -1213,7 +1205,7 @@ static bool redirect_start(session_t *ps) {
 	ps->drivers = detect_driver(ps->c.c, ps->backend_data, ps->c.screen_info->root);
 	apply_driver_workarounds(ps, ps->drivers);
 
-	if (ps->present_exists && ps->frame_pacing) {
+	if (ps->c.e.has_present && ps->frame_pacing) {
 		// Initialize rendering and frame timing statistics, and frame pacing
 		// states.
 		ps->last_msc_instant = 0;
@@ -1535,9 +1527,7 @@ static void handle_pending_updates(struct session *ps, double delta_t) {
 			w->running_animation_instance = NULL;
 			w->in_openclose = false;
 			if (w->saved_win_image != NULL) {
-				ps->backend_data->ops.release_image(ps->backend_data,
-				                                    w->saved_win_image);
-				w->saved_win_image = NULL;
+				win_release_saved_win_image(ps->backend_data, w);
 			}
 			if (w->state == WSTATE_UNMAPPED) {
 				unmap_win_finish(ps, w);
@@ -1855,8 +1845,8 @@ static bool load_shader_source(session_t *ps, const char *path) {
 	auto read_bytes = fread(shader->source, sizeof(char), num_bytes, f);
 	if (read_bytes < num_bytes || ferror(f)) {
 		// This is a difficult to hit error case, review thoroughly.
-		log_error("Failed to read custom shader at %s. (read %lu bytes, expected "
-		          "%lu bytes)",
+		log_error("Failed to read custom shader at %s. (read %zu bytes, expected "
+		          "%zu bytes)",
 		          path, read_bytes, num_bytes);
 		goto err;
 	}
@@ -1892,6 +1882,72 @@ static struct window_options win_options_from_config(const struct options *opts)
 	return ret;
 }
 
+static void show_config_warning_message_box(struct options *opt) {
+	if (opt->problematic_options == NULL) {
+		return;
+	}
+
+	struct x_connection c;
+	if (spawn_picomling(&c) != 0) {
+		return;
+	}
+
+	struct ui *ui = ui_new(&c);
+	if (ui == NULL) {
+		exit(1);
+	}
+
+	auto lines = HASH_COUNT(opt->problematic_options) + 4;
+	struct ui_message_box_line normal_line_template = {
+	    .text = NULL,
+	    .color = UI_COLOR_WHITE,
+	    .style = UI_STYLE_NORMAL,
+	    .justify = UI_JUSTIFY_LEFT,
+	    .pad_bottom = 3,
+	};
+	struct ui_message_box_content *content =
+	    malloc(sizeof(*content) + lines * sizeof(struct ui_message_box_line));
+	content->num_lines = lines;
+	content->margin = 10;
+	content->scale = 0;
+	content->lines[0] = (struct ui_message_box_line){
+	    .text = "picom Warning!",
+	    .color = UI_COLOR_YELLOW,
+	    .style = UI_STYLE_BOLD,
+	    .justify = UI_JUSTIFY_CENTER,
+	    .pad_bottom = 15,
+	};
+	content->lines[1] = normal_line_template;
+	content->lines[1].text =
+	    "Some of your settings have generated warnings. Check the console";
+	content->lines[2] = normal_line_template;
+	content->lines[2].text =
+	    "output of picom for more information. Offending options are:";
+	content->lines[2].pad_bottom = 10;
+	struct option_name *o, *no;
+	unsigned pos = 3;
+	HASH_ITER(hh, opt->problematic_options, o, no) {
+		char *buf = NULL;
+		casprintf(&buf, "    * %s", o->name);
+		content->lines[pos] = normal_line_template;
+		content->lines[pos].text = buf;
+		pos++;
+	}
+	content->lines[pos - 1].pad_bottom = 10;
+	content->lines[pos] = normal_line_template;
+	content->lines[pos].text = "(Press ESC to close)";
+	content->lines[pos].pad_bottom = 10;
+	content->lines[pos].justify = UI_JUSTIFY_CENTER;
+	ui_message_box_content_plan(ui, &c, content);
+	ui_message_box_show(ui, &c, content, 15);
+
+	for (unsigned i = 3; i < lines - 1; i++) {
+		free((void *)content->lines[i].text);
+	}
+	free(content);
+	exit(0);
+}
+
 // NOLINTBEGIN(readability-function-cognitive-complexity)
 
 /// Initialize a session.
@@ -1924,25 +1980,6 @@ static session_t *session_init(int argc, char **argv, Display *dpy,
 
 	    .last_msc = 0,
 
-	    .xfixes_event = 0,
-	    .xfixes_error = 0,
-	    .damage_event = 0,
-	    .damage_error = 0,
-	    .render_event = 0,
-	    .render_error = 0,
-	    .composite_event = 0,
-	    .composite_error = 0,
-	    .composite_opcode = 0,
-	    .shape_exists = false,
-	    .shape_event = 0,
-	    .shape_error = 0,
-	    .randr_exists = 0,
-	    .randr_event = 0,
-	    .randr_error = 0,
-	    .glx_exists = false,
-	    .glx_event = 0,
-	    .glx_error = 0,
-
 #ifdef CONFIG_DBUS
 	    .dbus_data = NULL,
 #endif
@@ -1969,84 +2006,14 @@ static session_t *session_init(int argc, char **argv, Display *dpy,
 
 	// Use the same Display across reset, primarily for resource leak checking
 	x_connection_init(&ps->c, dpy);
-
-	const xcb_query_extension_reply_t *ext_info;
-
-	xcb_prefetch_extension_data(ps->c.c, &xcb_render_id);
-	xcb_prefetch_extension_data(ps->c.c, &xcb_composite_id);
-	xcb_prefetch_extension_data(ps->c.c, &xcb_damage_id);
-	xcb_prefetch_extension_data(ps->c.c, &xcb_shape_id);
-	xcb_prefetch_extension_data(ps->c.c, &xcb_xfixes_id);
-	xcb_prefetch_extension_data(ps->c.c, &xcb_randr_id);
-	xcb_prefetch_extension_data(ps->c.c, &xcb_present_id);
-	xcb_prefetch_extension_data(ps->c.c, &xcb_sync_id);
-	xcb_prefetch_extension_data(ps->c.c, &xcb_glx_id);
-
-	ext_info = xcb_get_extension_data(ps->c.c, &xcb_render_id);
-	if (!ext_info || !ext_info->present) {
-		log_fatal("No render extension");
-		exit(1);
-	}
-	ps->render_event = ext_info->first_event;
-	ps->render_error = ext_info->first_error;
-
-	ext_info = xcb_get_extension_data(ps->c.c, &xcb_composite_id);
-	if (!ext_info || !ext_info->present) {
-		log_fatal("No composite extension");
-		exit(1);
-	}
-	ps->composite_opcode = ext_info->major_opcode;
-	ps->composite_event = ext_info->first_event;
-	ps->composite_error = ext_info->first_error;
-
-	{
-		xcb_composite_query_version_reply_t *reply = xcb_composite_query_version_reply(
-		    ps->c.c,
-		    xcb_composite_query_version(ps->c.c, XCB_COMPOSITE_MAJOR_VERSION,
-		                                XCB_COMPOSITE_MINOR_VERSION),
-		    NULL);
-
-		if (!reply || (reply->major_version == 0 && reply->minor_version < 2)) {
-			log_fatal("Your X server doesn't have Composite >= 0.2 support, "
-			          "we cannot proceed.");
-			exit(1);
-		}
-		free(reply);
-	}
-
-	ext_info = xcb_get_extension_data(ps->c.c, &xcb_damage_id);
-	if (!ext_info || !ext_info->present) {
-		log_fatal("No damage extension");
-		exit(1);
-	}
-	ps->damage_event = ext_info->first_event;
-	ps->damage_error = ext_info->first_error;
-	xcb_discard_reply(ps->c.c, xcb_damage_query_version(ps->c.c, XCB_DAMAGE_MAJOR_VERSION,
-	                                                    XCB_DAMAGE_MINOR_VERSION)
-	                               .sequence);
-
-	ext_info = xcb_get_extension_data(ps->c.c, &xcb_xfixes_id);
-	if (!ext_info || !ext_info->present) {
-		log_fatal("No XFixes extension");
-		exit(1);
-	}
-	ps->xfixes_event = ext_info->first_event;
-	ps->xfixes_error = ext_info->first_error;
-	xcb_discard_reply(ps->c.c, xcb_xfixes_query_version(ps->c.c, XCB_XFIXES_MAJOR_VERSION,
-	                                                    XCB_XFIXES_MINOR_VERSION)
-	                               .sequence);
-
-	ps->x_region = x_new_id(&ps->c);
-	if (!XCB_AWAIT_VOID(xcb_xfixes_create_region, ps->c.c, ps->x_region, 0, NULL)) {
-		log_fatal("Failed to create a XFixes region");
+	if (!x_extensions_init(&ps->c)) {
 		goto err;
 	}
 
-	ext_info = xcb_get_extension_data(ps->c.c, &xcb_glx_id);
-	if (ext_info && ext_info->present) {
-		ps->glx_exists = true;
-		ps->glx_error = ext_info->first_error;
-		ps->glx_event = ext_info->first_event;
+	ps->x_region = x_new_id(&ps->c);
+	if (!XCB_AWAIT_VOID(xcb_xfixes_create_region, &ps->c, ps->x_region, 0, NULL)) {
+		log_fatal("Failed to create a XFixes region");
+		goto err;
 	}
 
 	// Parse configuration file
@@ -2060,6 +2027,8 @@ static session_t *session_init(int argc, char **argv, Display *dpy,
 		          "invalid options.");
 		return NULL;
 	}
+
+	show_config_warning_message_box(&ps->o);
 
 	const char *basename = strrchr(argv[0], '/') ? strrchr(argv[0], '/') + 1 : argv[0];
 
@@ -2133,62 +2102,18 @@ static session_t *session_init(int argc, char **argv, Display *dpy,
 		}
 	}
 
-	// Query X Shape
-	ext_info = xcb_get_extension_data(ps->c.c, &xcb_shape_id);
-	if (ext_info && ext_info->present) {
-		ps->shape_event = ext_info->first_event;
-		ps->shape_error = ext_info->first_error;
-		ps->shape_exists = true;
-	}
-
-	ext_info = xcb_get_extension_data(ps->c.c, &xcb_randr_id);
-	if (ext_info && ext_info->present) {
-		ps->randr_exists = true;
-		ps->randr_event = ext_info->first_event;
-		ps->randr_error = ext_info->first_error;
-	}
-
-	ext_info = xcb_get_extension_data(ps->c.c, &xcb_present_id);
-	if (ext_info && ext_info->present) {
-		auto r = xcb_present_query_version_reply(
-		    ps->c.c,
-		    xcb_present_query_version(ps->c.c, XCB_PRESENT_MAJOR_VERSION,
-		                              XCB_PRESENT_MINOR_VERSION),
-		    NULL);
-		if (r) {
-			ps->present_exists = true;
-			free(r);
-		}
-	}
-
-	// Query X Sync
-	ext_info = xcb_get_extension_data(ps->c.c, &xcb_sync_id);
-	if (ext_info && ext_info->present) {
-		ps->xsync_error = ext_info->first_error;
-		ps->xsync_event = ext_info->first_event;
-		// Need X Sync 3.1 for fences
-		auto r = xcb_sync_initialize_reply(
-		    ps->c.c,
-		    xcb_sync_initialize(ps->c.c, XCB_SYNC_MAJOR_VERSION, XCB_SYNC_MINOR_VERSION),
-		    NULL);
-		if (r && (r->major_version > 3 ||
-		          (r->major_version == 3 && r->minor_version >= 1))) {
-			ps->xsync_exists = true;
-			free(r);
-		}
-	}
-
 	ps->sync_fence = XCB_NONE;
-	if (ps->xsync_exists) {
+	if (ps->c.e.has_sync) {
 		ps->sync_fence = x_new_id(&ps->c);
 		e = xcb_request_check(
 		    ps->c.c, xcb_sync_create_fence_checked(
 		                 ps->c.c, ps->c.screen_info->root, ps->sync_fence, 0));
 		if (e) {
 			if (ps->o.xrender_sync_fence) {
-				log_error_x_error(e, "Failed to create a XSync fence. "
-				                     "xrender-sync-fence will be "
-				                     "disabled");
+				log_error_x_error(&ps->c, e,
+				                  "Failed to create a XSync fence. "
+				                  "xrender-sync-fence will be "
+				                  "disabled");
 				ps->o.xrender_sync_fence = false;
 			}
 			ps->sync_fence = XCB_NONE;
@@ -2200,8 +2125,7 @@ static session_t *session_init(int argc, char **argv, Display *dpy,
 		ps->o.xrender_sync_fence = false;
 	}
 
-	// Query X RandR
-	if (ps->o.crop_shadow_to_monitor && !ps->randr_exists) {
+	if (ps->o.crop_shadow_to_monitor && !ps->c.e.has_randr) {
 		log_fatal("No X RandR extension. crop-shadow-to-monitor cannot be "
 		          "enabled.");
 		goto err;
@@ -2249,7 +2173,7 @@ static session_t *session_init(int argc, char **argv, Display *dpy,
 
 	// Monitor screen changes if vsync_sw is enabled and we are using
 	// an auto-detected refresh rate, or when X RandR features are enabled
-	if (ps->randr_exists) {
+	if (ps->c.e.has_randr) {
 		xcb_randr_select_input(ps->c.c, ps->c.screen_info->root,
 		                       XCB_RANDR_NOTIFY_MASK_SCREEN_CHANGE);
 		x_update_monitors_async(&ps->c, &ps->monitors);
@@ -2314,14 +2238,14 @@ static session_t *session_init(int argc, char **argv, Display *dpy,
 	                                    XCB_EVENT_MASK_EXPOSURE | XCB_EVENT_MASK_STRUCTURE_NOTIFY |
 	                                    XCB_EVENT_MASK_PROPERTY_CHANGE}));
 	if (e) {
-		log_error_x_error(e, "Failed to setup root window event mask");
+		log_error_x_error(&ps->c, e, "Failed to setup root window event mask");
 		free(e);
 		goto err;
 	}
 
 	// Query the size of the root window. We need the size information before any
 	// window can be managed.
-	auto r = XCB_AWAIT(xcb_get_geometry, ps->c.c, ps->c.screen_info->root);
+	auto r = XCB_AWAIT(xcb_get_geometry, &ps->c, ps->c.screen_info->root);
 	if (!r) {
 		log_fatal("Failed to get geometry of the root window");
 		goto err;
@@ -2355,7 +2279,7 @@ static session_t *session_init(int argc, char **argv, Display *dpy,
 		// release it.
 		auto get_overlay =
 		    xcb_composite_get_overlay_window(ps->c.c, ps->c.screen_info->root);
-		XCB_AWAIT_VOID(xcb_composite_release_overlay_window, ps->c.c,
+		XCB_AWAIT_VOID(xcb_composite_release_overlay_window, &ps->c,
 		               ps->c.screen_info->root);
 		auto overlay_reply =
 		    xcb_composite_get_overlay_window_reply(ps->c.c, get_overlay, NULL);

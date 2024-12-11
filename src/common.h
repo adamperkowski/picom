@@ -115,7 +115,7 @@ typedef struct session {
 	xcb_window_t debug_window;
 	/// The backend data the root pixmap bound to
 	image_handle root_image;
-	/// The root pixmap generation, incremented everytime
+	/// The root pixmap generation, incremented every time
 	/// the root pixmap changes
 	uint64_t root_image_generation;
 	/// A region of the size of the screen.
@@ -207,52 +207,8 @@ typedef struct session {
 	long paint_tm_offset;
 
 	// === X extension related ===
-	/// Event base number for X Fixes extension.
-	int xfixes_event;
-	/// Error base number for X Fixes extension.
-	int xfixes_error;
-	/// Event base number for X Damage extension.
-	int damage_event;
-	/// Error base number for X Damage extension.
-	int damage_error;
-	/// Event base number for X Render extension.
-	int render_event;
-	/// Error base number for X Render extension.
-	int render_error;
-	/// Event base number for X Composite extension.
-	int composite_event;
-	/// Error base number for X Composite extension.
-	int composite_error;
-	/// Major opcode for X Composite extension.
-	int composite_opcode;
-	/// Whether X Shape extension exists.
-	bool shape_exists;
-	/// Event base number for X Shape extension.
-	int shape_event;
-	/// Error base number for X Shape extension.
-	int shape_error;
-	/// Whether X RandR extension exists.
-	bool randr_exists;
-	/// Event base number for X RandR extension.
-	int randr_event;
-	/// Error base number for X RandR extension.
-	int randr_error;
-	/// Whether X Present extension exists.
-	bool present_exists;
-	/// Whether X GLX extension exists.
-	bool glx_exists;
-	/// Event base number for X GLX extension.
-	int glx_event;
-	/// Error base number for X GLX extension.
-	int glx_error;
 	/// Information about monitors.
 	struct x_monitors monitors;
-	/// Whether X Sync extension exists.
-	bool xsync_exists;
-	/// Event base number for X Sync extension.
-	int xsync_event;
-	/// Error base number for X Sync extension.
-	int xsync_error;
 
 	// === Atoms ===
 	struct atom *atoms;
@@ -275,39 +231,6 @@ extern session_t *ps_g;
 void ev_xcb_error(session_t *ps, xcb_generic_error_t *err);
 
 // === Functions ===
-
-/**
- * Subtracting two struct timespec values.
- *
- * Taken from glibc manual.
- *
- * Subtract the `struct timespec' values X and Y,
- * storing the result in RESULT.
- * Return 1 if the difference is negative, otherwise 0.
- */
-static inline int
-timespec_subtract(struct timespec *result, struct timespec *x, struct timespec *y) {
-	/* Perform the carry for the later subtraction by updating y. */
-	if (x->tv_nsec < y->tv_nsec) {
-		long nsec = (y->tv_nsec - x->tv_nsec) / NS_PER_SEC + 1;
-		y->tv_nsec -= NS_PER_SEC * nsec;
-		y->tv_sec += nsec;
-	}
-
-	if (x->tv_nsec - y->tv_nsec > NS_PER_SEC) {
-		long nsec = (x->tv_nsec - y->tv_nsec) / NS_PER_SEC;
-		y->tv_nsec += NS_PER_SEC * nsec;
-		y->tv_sec -= nsec;
-	}
-
-	/* Compute the time remaining to wait.
-	   tv_nsec is certainly positive. */
-	result->tv_sec = x->tv_sec - y->tv_sec;
-	result->tv_nsec = x->tv_nsec - y->tv_nsec;
-
-	/* Return 1 if result is negative. */
-	return x->tv_sec < y->tv_sec;
-}
 
 /**
  * Get current time in struct timeval.
